@@ -29,6 +29,8 @@ cp ../.env.example .env   # fill in keys; source it or export before running
 python test_pipeline.py   # self-check (offline)
 
 python pipeline.py ingest --regions KR --limit 3 [--dry-run]   # Nodes 1-3
+python pipeline.py topics                                      # merge same-topic articles
+python pipeline.py briefings [--week 2026-W44] [--markets KR]   # per-market briefings -> DB
 python pipeline.py weekly [--send]                             # Node 4 (default dry-run print)
 ```
 

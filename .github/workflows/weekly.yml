@@ -13,6 +13,13 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r backend/requirements.txt
+      - run: python pipeline.py briefings
+        working-directory: backend
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PROCESS_MODEL: ${{ vars.PROCESS_MODEL || 'deepseek-chat' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       - run: python pipeline.py weekly --send
         working-directory: backend
         env:
