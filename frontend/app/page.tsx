@@ -1,11 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { ArrowDownUp, ArrowUpRight, CalendarDays, Check, ChevronDown, CircleAlert, Clock3, ExternalLink, Filter, LoaderCircle, Search, X, Zap } from 'lucide-react';
 
 type Article = {
   id: string;
+  topic_key: string | null;
   source_url: string;
   source_name: string | null;
   discovery_method: 'RSS' | 'ACTIVE_SEARCH' | string | null;
@@ -26,11 +27,12 @@ type Article = {
   strategic_implication_en: string | null;
 };
 type ArticleText = { full_text_original: string | null; full_text_en: string | null };
+type WeeklyBriefing = { id: string; region_group: string; iso_week: string; briefing_html: string; article_count: number };
 type ViewMode = 'side' | 'english' | 'original';
 
 const REGIONS = ['KR', 'JP', 'TW', 'SG', 'SEA', 'AU_NZ', 'MENA', 'MX', 'BR', 'ZA'];
 const TAGS = ['#CPO_Network', '#eMSP_Roaming', '#Policy_Subsidy', '#Hardware_Tech', '#Grid_Energy', '#OEM_Initiative', '#Partnership_MnA'];
-const FEED_COLUMNS = 'id,source_url,source_name,discovery_method,search_query_used,published_at,scraped_at,iso_week,region_group,secondary_regions,country_code,original_language,category_tags,mentioned_entities,importance_score,title_original,title_en,summary_bullets_en,strategic_implication_en';
+const FEED_COLUMNS = 'id,topic_key,source_url,source_name,discovery_method,search_query_used,published_at,scraped_at,iso_week,region_group,secondary_regions,country_code,original_language,category_tags,mentioned_entities,importance_score,title_original,title_en,summary_bullets_en,strategic_implication_en';
 const FLAGS: Record<string, string> = { KR: '🇰🇷', JP: '🇯🇵', TW: '🇹🇼', SG: '🇸🇬', TH: '🇹🇭', ID: '🇮🇩', VN: '🇻🇳', MY: '🇲🇾', AU: '🇦🇺', NZ: '🇳🇿', AE: '🇦🇪', SA: '🇸🇦', QA: '🇶🇦', EG: '🇪🇬', IL: '🇮🇱', MX: '🇲🇽', BR: '🇧🇷', ZA: '🇿🇦' };
 const REGION_NAMES: Record<string, string> = { KR: 'South Korea', JP: 'Japan', TW: 'Taiwan', SG: 'Singapore', SEA: 'Southeast Asia', AU_NZ: 'Australia & NZ', MENA: 'Middle East & North Africa', MX: 'Mexico', BR: 'Brazil', ZA: 'South Africa' };
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -45,6 +47,45 @@ function dateLabel(value: string | null) {
 function flagFor(code: string | null) { return code ? FLAGS[code.toUpperCase()] ?? '🌐' : '🌐'; }
 function searchableText(article: Article) {
   return [article.title_en, ...(article.summary_bullets_en ?? []), ...(article.mentioned_entities ?? [])].filter(Boolean).join(' ').toLocaleLowerCase();
+}
+function groupArticles(rows: Article[]) {
+  // ponytail: grouping client-side over the 500-row fetch.
+  const groups = new Map<string, Article[]>();
+  rows.forEach((article) => {
+    const key = article.topic_key && !article.topic_key.startsWith('solo-') ? article.topic_key : `solo:${article.id}`;
+    const group = groups.get(key);
+    if (group) group.push(article);
+    else groups.set(key, [article]);
+  });
+  return Array.from(groups.values()).map((group) => {
+    group.sort((a, b) => (b.importance_score ?? -Infinity) - (a.importance_score ?? -Infinity) || new Date(b.published_at ?? 0).getTime() - new Date(a.published_at ?? 0).getTime());
+    return { article: group[0], also: group.slice(1) };
+  }).sort((a, b) => new Date(b.article.published_at ?? 0).getTime() - new Date(a.article.published_at ?? 0).getTime());
+}
+function renderBriefingMarkup(html: string): ReactNode[] {
+  if (typeof DOMParser === 'undefined') return [html];
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+  const renderNode = (node: Node, key: string): ReactNode => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+    const element = node as HTMLElement;
+    const children = Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`));
+    switch (element.tagName.toLowerCase()) {
+      case 'b': case 'strong': return <strong key={key}>{children}</strong>;
+      case 'i': case 'em': return <em key={key}>{children}</em>;
+      case 'br': return <br key={key}/>;
+      case 'a': {
+        const href = element.getAttribute('href') ?? '';
+        try {
+          const url = new URL(href);
+          if (url.protocol === 'http:' || url.protocol === 'https:') return <a key={key} href={url.href} target="_blank" rel="noreferrer" className="text-accent underline decoration-accent/40 underline-offset-2">{children}</a>;
+        } catch { /* Invalid and non-absolute URLs render as plain text. */ }
+        return children;
+      }
+      default: return children;
+    }
+  };
+  return Array.from(parsed.body.childNodes).map((node, index) => renderNode(node, `briefing-${index}`));
 }
 
 export default function Dashboard() {
@@ -62,6 +103,11 @@ export default function Dashboard() {
   const [readerLoading, setReaderLoading] = useState(false);
   const [readerError, setReaderError] = useState('');
   const [viewMode, setViewMode] = useState<ViewMode>('side');
+  const [briefingOpen, setBriefingOpen] = useState(false);
+  const [briefings, setBriefings] = useState<WeeklyBriefing[]>([]);
+  const [briefingLoading, setBriefingLoading] = useState(false);
+  const [briefingError, setBriefingError] = useState('');
+  const [briefingRegion, setBriefingRegion] = useState(REGIONS[0]);
 
   useEffect(() => {
     if (!supabase) { setLoading(false); return; }
@@ -80,6 +126,31 @@ export default function Dashboard() {
     })();
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (!briefingOpen) return;
+    let cancelled = false;
+    setBriefingLoading(true);
+    setBriefingError('');
+    if (!supabase) {
+      setBriefingError('Supabase env not configured.');
+      setBriefingLoading(false);
+      return;
+    }
+    (async () => {
+      try {
+        const { data, error } = await supabase.from('weekly_briefings').select('id,region_group,iso_week,briefing_html,article_count,created_at').order('iso_week', { ascending: false });
+        if (cancelled) return;
+        if (error) setBriefingError(error.message);
+        else setBriefings((data ?? []) as WeeklyBriefing[]);
+      } catch (error) {
+        if (!cancelled) setBriefingError(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (!cancelled) setBriefingLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [briefingOpen]);
 
   const weeks = useMemo(() => Array.from(new Set(articles.map((article) => article.iso_week).filter((week): week is string => Boolean(week)))).sort().reverse(), [articles]);
   const filteredArticles = useMemo(() => {
@@ -103,6 +174,9 @@ export default function Dashboard() {
       return true;
     });
   }, [articles, region, tags, timeframe, fromDate, toDate, search]);
+  const mergedArticles = useMemo(() => groupArticles(filteredArticles), [filteredArticles]);
+  const selectedBriefingRegion = region === 'All' ? briefingRegion : region;
+  const selectedBriefing = briefings.find((briefing) => briefing.region_group === selectedBriefingRegion);
 
   const openReader = useCallback(async (article: Article) => {
     setActiveArticle(article);
@@ -130,6 +204,13 @@ export default function Dashboard() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [activeArticle, closeReader]);
 
+  useEffect(() => {
+    if (!briefingOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setBriefingOpen(false); };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [briefingOpen]);
+
   const toggleTag = (tag: string) => setTags((selected) => selected.includes(tag) ? selected.filter((item) => item !== tag) : [...selected, tag]);
   const resetFilters = () => { setRegion('All'); setTags([]); setTimeframe('All'); setFromDate(''); setToDate(''); setSearch(''); };
 
@@ -149,7 +230,7 @@ export default function Dashboard() {
       {feedError && <div role="alert" className="mb-6 flex items-start gap-3 rounded-xl border border-rose-400/30 bg-rose-400/[0.08] p-4 text-sm text-rose-100"><CircleAlert className="mt-0.5 shrink-0" size={18}/><div><strong>Could not load articles</strong><p className="mt-1 break-words text-rose-100/75">{feedError}</p></div></div>}
 
       <section aria-label="Article filters" className="mb-7 rounded-2xl border border-line bg-panel/80 p-4 shadow-glow sm:p-5">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 text-sm font-semibold text-slate-100"><Filter size={15} className="text-accent"/> Refine intelligence</div><button onClick={resetFilters} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted transition hover:bg-white/5 hover:text-white"><X size={13}/> Clear filters</button></div>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 text-sm font-semibold text-slate-100"><Filter size={15} className="text-accent"/> Refine intelligence</div><div className="flex flex-wrap items-center gap-2"><button onClick={() => setBriefingOpen(true)} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-accent/25 bg-accent/[0.06] px-3 text-xs font-semibold text-accent transition hover:bg-accent/10"><CalendarDays size={14}/> Weekly Briefing</button><button onClick={resetFilters} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted transition hover:bg-white/5 hover:text-white"><X size={13}/> Clear filters</button></div></div>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_1.15fr_1.45fr]">
           <label className="relative block"><span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[.15em] text-muted">Market</span><select value={region} onChange={(event) => setRegion(event.target.value)} className="h-11 w-full appearance-none rounded-lg border border-line bg-[#0b1219] px-3 pr-9 text-sm text-slate-100 outline-none transition focus:border-accent/60"><option>All</option>{REGIONS.map((item) => <option key={item} value={item}>{item} · {REGION_NAMES[item]}</option>)}</select><ChevronDown size={15} className="pointer-events-none absolute bottom-3 right-3 text-muted"/></label>
           <label className="relative block"><span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[.15em] text-muted">Timeframe</span><select value={timeframe} onChange={(event) => setTimeframe(event.target.value)} className="h-11 w-full appearance-none rounded-lg border border-line bg-[#0b1219] px-3 pr-9 text-sm text-slate-100 outline-none transition focus:border-accent/60"><option>All</option><option>Last 7 Days</option><option>Last 30 Days</option><option>Custom Date Range</option>{weeks.map((week) => <option value={week} key={week}>{week}</option>)}</select><ChevronDown size={15} className="pointer-events-none absolute bottom-3 right-3 text-muted"/></label>
@@ -159,15 +240,16 @@ export default function Dashboard() {
         <div className="mt-4 border-t border-line/70 pt-4"><div className="mb-2.5 text-[10px] font-bold uppercase tracking-[.15em] text-muted">Intelligence categories <span className="ml-1 font-normal normal-case tracking-normal text-slate-600">(select multiple)</span></div><div className="flex flex-wrap gap-2">{TAGS.map((tag) => { const selected = tags.includes(tag); return <button key={tag} onClick={() => toggleTag(tag)} aria-pressed={selected} className={`inline-flex min-h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-medium transition ${selected ? 'border-accent/40 bg-accent/10 text-accent' : 'border-line bg-[#0b1219] text-slate-400 hover:border-slate-500 hover:text-slate-200'}`}>{selected && <Check size={11}/>} {tag}</button>; })}</div></div>
       </section>
 
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-2"><div className="text-sm font-medium text-slate-300">Latest intelligence <span className="ml-1.5 rounded-md bg-white/[0.06] px-2 py-1 text-xs text-muted">{loading ? '…' : filteredArticles.length}</span></div><div className="inline-flex items-center gap-1.5 text-[11px] text-slate-500"><ArrowDownUp size={13}/> Sorted by publication date</div></div>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2"><div className="text-sm font-medium text-slate-300">Latest intelligence <span className="ml-1.5 rounded-md bg-white/[0.06] px-2 py-1 text-xs text-muted">{loading ? '…' : mergedArticles.length}</span></div><div className="inline-flex items-center gap-1.5 text-[11px] text-slate-500"><ArrowDownUp size={13}/> Sorted by publication date</div></div>
       {loading && <div className="flex min-h-48 items-center justify-center gap-3 text-sm text-muted"><LoaderCircle size={18} className="animate-spin text-accent"/> Loading market signals…</div>}
-      {!loading && !feedError && filteredArticles.length === 0 && <div className="rounded-2xl border border-dashed border-line bg-panel/45 px-5 py-16 text-center"><div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-full border border-line bg-[#0b1219] text-muted"><Search size={18}/></div><h2 className="text-base font-semibold text-slate-200">No articles match these filters</h2><p className="mt-1.5 text-sm text-muted">Try broadening your market, timeframe, or search terms.</p><button onClick={resetFilters} className="mt-4 rounded-lg border border-line px-3 py-2 text-xs font-semibold text-accent hover:bg-accent/5">Clear all filters</button></div>}
-      <div className="grid gap-4">{!loading && filteredArticles.map((article) => <article key={article.id} role="button" tabIndex={0} onClick={() => void openReader(article)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void openReader(article); } }} className="group cursor-pointer rounded-2xl border border-line bg-panel/75 p-4 transition duration-200 hover:border-slate-600 hover:bg-panel sm:p-5 lg:p-6">
-        <div className="mb-4 flex flex-wrap items-center gap-2"><span className="inline-flex items-center gap-1.5 rounded-md border border-line bg-[#0b1219] px-2 py-1 text-[11px] font-semibold text-slate-200"><span className="text-sm">{flagFor(article.country_code)}</span>{article.region_group || 'Other'}</span><span className="inline-flex items-center gap-1 rounded-md border border-line/80 bg-white/[0.03] px-2 py-1 text-[10px] font-medium text-slate-400">{article.discovery_method === 'RSS' ? '📡 RSS' : '🔍 Active Search'}</span><span className="inline-flex items-center gap-1 rounded-md border border-amber-400/20 bg-amber-300/[0.06] px-2 py-1 text-[11px] font-semibold text-amber-200">★ {article.importance_score ?? '—'}<span className="font-normal text-amber-100/60">/5</span></span><span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-slate-500"><Clock3 size={12}/>{dateLabel(article.published_at)}</span></div>
+      {!loading && !feedError && mergedArticles.length === 0 && <div className="rounded-2xl border border-dashed border-line bg-panel/45 px-5 py-16 text-center"><div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-full border border-line bg-[#0b1219] text-muted"><Search size={18}/></div><h2 className="text-base font-semibold text-slate-200">No articles match these filters</h2><p className="mt-1.5 text-sm text-muted">Try broadening your market, timeframe, or search terms.</p><button onClick={resetFilters} className="mt-4 rounded-lg border border-line px-3 py-2 text-xs font-semibold text-accent hover:bg-accent/5">Clear all filters</button></div>}
+      <div className="grid gap-4">{!loading && mergedArticles.map(({ article, also }) => <article key={article.topic_key && !article.topic_key.startsWith('solo-') ? article.topic_key : article.id} role="button" tabIndex={0} onClick={() => void openReader(article)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void openReader(article); } }} className="group cursor-pointer rounded-2xl border border-line bg-panel/75 p-4 transition duration-200 hover:border-slate-600 hover:bg-panel sm:p-5 lg:p-6">
+        <div className="mb-4 flex flex-wrap items-center gap-2"><span className="inline-flex items-center gap-1.5 rounded-md border border-line bg-[#0b1219] px-2 py-1 text-[11px] font-semibold text-slate-200"><span className="text-sm">{flagFor(article.country_code)}</span>{article.region_group || 'Other'}</span><span className="inline-flex items-center gap-1 rounded-md border border-line/80 bg-white/[0.03] px-2 py-1 text-[10px] font-medium text-slate-400">{article.discovery_method === 'RSS' ? '📡 RSS' : '🔍 Active Search'}</span><span className="inline-flex items-center gap-1 rounded-md border border-amber-400/20 bg-amber-300/[0.06] px-2 py-1 text-[11px] font-semibold text-amber-200">★ {article.importance_score ?? '—'}<span className="font-normal text-amber-100/60">/5</span></span>{also.length > 0 && <span className="inline-flex items-center rounded-md border border-accent/20 bg-accent/[0.07] px-2 py-1 text-[10px] font-semibold text-accent">{also.length + 1} articles</span>}<span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-slate-500"><Clock3 size={12}/>{dateLabel(article.published_at)}</span></div>
         <div className="mb-3 flex flex-wrap gap-1.5">{(article.category_tags ?? []).map((tag) => <span key={tag} className="rounded border border-accent/15 bg-accent/[0.05] px-2 py-1 text-[10px] font-medium text-accent/80">{tag}</span>)}</div>
         <div className="flex items-start justify-between gap-4"><h2 className="max-w-5xl text-lg font-semibold leading-snug tracking-[-.015em] text-slate-100 transition group-hover:text-white sm:text-xl">{article.title_en || article.title_original || 'Untitled article'}</h2><ArrowUpRight size={17} className="mt-1 shrink-0 text-slate-600 transition group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-accent"/></div>
         <div className="mt-2 text-[11px] text-slate-500">{article.source_name || 'Unknown source'}</div>
         {!!article.summary_bullets_en?.length && <ul className="mt-4 space-y-2">{article.summary_bullets_en.map((bullet, index) => <li key={`${index}-${bullet}`} className="flex gap-2.5 text-sm leading-6 text-slate-300"><span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-slate-500"/>{bullet}</li>)}</ul>}
+        {also.length > 0 && <div className="mt-4 border-t border-line/70 pt-3"><div className="mb-2 text-[10px] font-bold uppercase tracking-[.14em] text-muted">Also covered by:</div><ul className="space-y-1.5">{also.map((other) => <li key={other.id}><button onClick={(event) => { event.stopPropagation(); void openReader(other); }} onKeyDown={(event) => event.stopPropagation()} className="text-left text-xs leading-5 text-slate-400 transition hover:text-accent"><span className="text-slate-200">{other.title_en || other.title_original || 'Untitled article'}</span><span className="text-slate-600"> · {other.source_name || 'Unknown source'}</span></button></li>)}</ul></div>}
         {article.strategic_implication_en && <div className="mt-4 rounded-lg border-l-2 border-accent/70 bg-accent/[0.055] px-4 py-3"><div className="mb-1 text-[10px] font-bold uppercase tracking-[.16em] text-accent">So what</div><p className="text-sm leading-6 text-slate-200/90">{article.strategic_implication_en}</p></div>}
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line/70 pt-3"><span className="text-xs font-medium text-slate-400">{article.source_name || 'Source unavailable'}</span>{article.iso_week && <span className="text-[10px] font-medium tracking-wide text-slate-600">{article.iso_week}</span>}</div>
       </article>)}</div>
@@ -179,6 +261,16 @@ export default function Dashboard() {
           {readerLoading && <div className="flex min-h-52 items-center justify-center gap-3 text-sm text-muted"><LoaderCircle size={18} className="animate-spin text-accent"/>Loading full article…</div>}
           {readerError && <div role="alert" className="flex items-start gap-3 rounded-xl border border-rose-400/30 bg-rose-400/[0.08] p-4 text-sm text-rose-100"><CircleAlert size={17} className="mt-0.5 shrink-0"/><div><strong>Could not load the full article</strong><p className="mt-1 break-words text-rose-100/75">{readerError}</p></div></div>}
           {!readerLoading && !readerError && articleText && <>{(viewMode === 'side' || viewMode === 'original') && <section className="min-w-0 rounded-xl border border-line/80 bg-[#080d13]/55 p-4 sm:p-5"><h3 className="mb-3 text-[10px] font-bold uppercase tracking-[.16em] text-muted">Original · {activeArticle.original_language || 'language unknown'}</h3><div className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">{articleText.full_text_original || 'No original-language text available.'}</div></section>}{(viewMode === 'side' || viewMode === 'english') && <section className="min-w-0 rounded-xl border border-line/80 bg-[#080d13]/55 p-4 sm:p-5"><h3 className="mb-3 text-[10px] font-bold uppercase tracking-[.16em] text-accent">English translation</h3><div className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">{articleText.full_text_en || 'No English translation available.'}</div></section>}</>}
+        </div>
+      </section></div>}
+      {briefingOpen && <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-sm sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setBriefingOpen(false); }}><section role="dialog" aria-modal="true" aria-labelledby="briefing-title" className="flex max-h-[96vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl border border-line bg-[#0c131b] shadow-2xl sm:max-h-[88vh] sm:rounded-2xl">
+        <header className="flex items-center justify-between gap-4 border-b border-line px-4 py-4 sm:px-6"><div><div className="mb-1 text-[10px] font-bold uppercase tracking-[.16em] text-accent">Regional intelligence</div><h2 id="briefing-title" className="text-lg font-semibold text-white">Weekly Briefing</h2></div><button onClick={() => setBriefingOpen(false)} aria-label="Close weekly briefing" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-line text-slate-400 transition hover:bg-white/5 hover:text-white"><X size={17}/></button></header>
+        <div className="min-h-0 overflow-auto p-4 sm:p-6">
+          {region === 'All' && <div className="mb-5 flex flex-wrap gap-2" aria-label="Briefing market">{REGIONS.map((item) => <button key={item} onClick={() => setBriefingRegion(item)} aria-pressed={briefingRegion === item} className={`min-h-9 rounded-lg border px-3 text-xs font-semibold transition ${briefingRegion === item ? 'border-accent/40 bg-accent/10 text-accent' : 'border-line bg-[#080d13] text-slate-400 hover:text-white'}`}>{item}</button>)}</div>}
+          {briefingLoading && <div className="flex min-h-40 items-center justify-center gap-3 text-sm text-muted"><LoaderCircle size={18} className="animate-spin text-accent"/>Loading weekly briefings…</div>}
+          {briefingError && <div role="alert" className="flex items-start gap-3 rounded-xl border border-rose-400/30 bg-rose-400/[0.08] p-4 text-sm text-rose-100"><CircleAlert size={17} className="mt-0.5 shrink-0"/><div><strong>Could not load weekly briefing</strong><p className="mt-1 break-words text-rose-100/75">{briefingError}</p></div></div>}
+          {!briefingLoading && !briefingError && selectedBriefing && <><div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4"><div className="text-xs font-semibold text-slate-300">{selectedBriefingRegion} · {REGION_NAMES[selectedBriefingRegion]}</div><div className="rounded-md border border-line bg-[#080d13] px-2.5 py-1.5 text-xs font-medium text-slate-300">{selectedBriefing.iso_week} <span className="ml-1 text-muted">· {selectedBriefing.article_count} articles</span></div></div><div className="space-y-3 break-words text-sm leading-7 text-slate-200">{renderBriefingMarkup(selectedBriefing.briefing_html)}</div></>}
+          {!briefingLoading && !briefingError && !selectedBriefing && <div className="rounded-xl border border-dashed border-line px-5 py-12 text-center text-sm text-muted">No briefing generated yet for this market.</div>}
         </div>
       </section></div>}
     </div>

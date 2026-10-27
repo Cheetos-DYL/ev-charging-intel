@@ -27,7 +27,10 @@ def chat(messages: list[dict], model: str, max_tokens: int = 4096, temperature: 
                 json=payload, timeout=180,
             )
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            content = r.json()["choices"][0]["message"].get("content") or ""
+            if not content.strip():
+                raise ValueError("empty completion (provider quirk on large prompts) → next payload")
+            return content
         except Exception as e:
             last_err = e
     raise RuntimeError(f"LLM call failed: {last_err}")

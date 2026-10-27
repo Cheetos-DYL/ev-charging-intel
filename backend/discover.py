@@ -1,11 +1,13 @@
 """Node 1: discovery — Google News RSS (always) + Serper active search (if key)."""
 import base64
 import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
 import httpx
+from urllib.parse import parse_qs, parse_qsl
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 
@@ -43,6 +45,9 @@ def decode_gnews_target(url: str) -> str | None:
 
 def resolve_source_url(url: str, timeout: float = 15.0) -> str | None:
     """Return the real article URL (or None if unresolvable)."""
+    q = parse_qs(urlparse(url).query)
+    if "url" in q:  # Bing apiclick redirector passes the target as ?url=
+        return q["url"][0]
     if "news.google.com" not in url:
         return url
     dec = decode_gnews_target(url)
@@ -56,11 +61,15 @@ def resolve_source_url(url: str, timeout: float = 15.0) -> str | None:
         return None
 
 
-def gnews_rss_url(search: dict) -> str:
+def news_rss_url(query: str, language: str, gl: str) -> str:
+    """Bing News RSS search — real URLs, past-week window. (Google News RSS links no
+    longer decode to targets upstream, 2025-10; qft interval:\"8\" = past week.
+    Bing RSS silently returns 0 for parenthesized booleans — pass plain phrases.)"""
     from urllib.parse import quote
+    setmkt = f"{language.split('-')[0]}-{gl}"
     return (
-        "https://news.google.com/rss/search?q=" + quote(search["query"])
-        + f"&hl={search['hl']}&gl={search['gl']}&ceid={search['ceid']}"
+        "https://www.bing.com/news/search?q=" + quote(query)
+        + f"&format=RSS&setmkt={setmkt}&qft=" + quote('interval:"8"')
     )
 
 
@@ -73,32 +82,37 @@ def _entry_dt(entry) -> str:
 
 
 def fetch_rss(search: dict, limit: int) -> list[dict]:
-    """Google News RSS entries, limited to the freshest `limit` items."""
-    url = gnews_rss_url(search)
-    try:
-        resp = httpx.get(url, timeout=30, headers={"User-Agent": UA}, follow_redirects=True)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[discover] RSS fetch failed {search['region_group']}/{search['ceid']}: {e}")
-        return []
-    feed = feedparser.parse(resp.content)
+    """News-search RSS entries per phrase query, limited to the freshest `limit` items."""
+    queries = search.get("bing_queries") or [search["query"]]
     out = []
-    for entry in feed.entries[:limit]:
-        link = entry.get("link", "")
-        if not link:
+    for q in queries:
+        url = news_rss_url(q, search["language"], search["gl"])
+        time.sleep(2)  # ponytail: Bing throttles rapid-fire RSS with silently-empty feeds; 2s spacing suffices at daily cadence
+        try:
+            resp = httpx.get(url, timeout=30, headers={"User-Agent": UA}, follow_redirects=True)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[discover] RSS fetch failed {search['region_group']}/{search['gl']}: {e}")
             continue
-        out.append(dict(
-            url=link,
-            title=entry.get("title", "").strip(),
-            source_name=(entry.get("source") or {}).get("title") or search["gl"],
-            published_at=_entry_dt(entry),
-            region_group=search["region_group"],
-            country_code=search["country_code"],
-            language=search["language"],
-            search_query_used=search["query"],
-            discovery_method="RSS",
-        ))
-    return out
+        feed = feedparser.parse(resp.content)
+        for entry in feed.entries[:limit]:
+            link = entry.get("link", "")
+            if not link:
+                continue
+            out.append(dict(
+                url=link,
+                title=entry.get("title", "").strip(),
+                source_name=(entry.get("source") or {}).get("title") or urlparse(link).netloc or search["gl"],
+                published_at=_entry_dt(entry),
+                region_group=search["region_group"],
+                country_code=search["country_code"],
+                language=search["language"],
+                search_query_used=q,
+                discovery_method="RSS",
+            ))
+        if len(out) >= limit:
+            break
+    return out[:limit]
 
 
 def fetch_serper(search: dict, limit: int) -> list[dict]:
@@ -175,5 +189,7 @@ def discover(sources: list[dict], limit: int = 5) -> list[dict]:
                 continue
             seen.add(key)
             item["url"] = key  # store normalized (URL UNIQUE in DB)
+            if "bing.com" in item["source_name"] or "google.com" in item["source_name"]:
+                item["source_name"] = urlparse(real).netloc  # redirector host → real outlet
             out.append(item)
     return out

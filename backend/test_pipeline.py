@@ -1,10 +1,11 @@
 """Runnable self-check for the pure logic. Run: python test_pipeline.py"""
 import base64
 from datetime import date
+from urllib.parse import quote
 
 from agents import excerpt_of
 from config import CATEGORY_TAGS, SEARCHES
-from discover import decode_gnews_target, gnews_rss_url, normalize_url
+from discover import decode_gnews_target, normalize_url
 from llm import parse_json
 from pipeline import iso_week
 from telegram import format_briefing, split_message
@@ -22,13 +23,22 @@ def test_decode_gnews_target():
     assert decode_gnews_target("https://example.com/plain") is None
 
 
-def test_gnews_urls():
+def test_news_urls():
+    from discover import news_rss_url
     for s in SEARCHES:
-        assert {"region_group", "country_code", "language", "hl", "gl", "ceid", "query"} <= set(s)
-        u = gnews_rss_url(s)
-        assert u.startswith("https://news.google.com/rss/search?q=") and f"ceid={s['ceid']}" in u
+        assert {"region_group", "country_code", "language", "hl", "gl", "ceid", "query", "bing_queries"} <= set(s)
+        u = news_rss_url(s["bing_queries"][0], s["language"], s["gl"])
+        assert u.startswith("https://www.bing.com/news/search?q=")
+        assert f"setmkt={s['language'].split('-')[0]}-{s['gl']}" in u
     assert {s["region_group"] for s in SEARCHES} == {"KR", "JP", "TW", "SG", "SEA", "AU_NZ", "MENA", "MX", "BR", "ZA"}
     assert len(CATEGORY_TAGS) == 7
+
+
+def test_resolve_bing_redirect():
+    from discover import resolve_source_url
+    target = "https://zecar.com/reviews/bp-pulse-melbourne-airport-24-bay-ev-charging-hub"
+    bing = "http://www.bing.com/news/apiclick.aspx?ref=FexRss&aid=&tid=x&url=" + quote(target)
+    assert resolve_source_url(bing) == target
 
 
 def test_direct_feeds():
@@ -41,6 +51,23 @@ def test_direct_feeds():
 def test_iso_week():
     assert iso_week(date(2026, 10, 26)) == "2026-W44"
     assert iso_week(date(2026, 1, 1)) == "2026-W01"
+
+
+def test_within_days():
+    from pipeline import within_days
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    assert within_days((now - timedelta(days=3)).isoformat(), 7)
+    assert not within_days((now - timedelta(days=30)).isoformat(), 7)
+    assert within_days((now - timedelta(days=30)).isoformat(), 0)
+    assert within_days("garbage-date", 7)  # unparsable → keep
+
+
+def test_topic_slug():
+    from pipeline import topic_slug
+    assert topic_slug("TNB Electron ACE 2026 Launch!") == "tnb-electron-ace-2026-launch"
+    assert topic_slug("한글 슬러그") == "topic"  # non-latin → fallback
+    assert len(topic_slug("x" * 200)) == 60
 
 
 def test_split_message():

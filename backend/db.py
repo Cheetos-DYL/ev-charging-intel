@@ -29,3 +29,24 @@ def articles_for_week(iso_week: str) -> list[dict]:
             .eq("iso_week", iso_week)
             .order("importance_score", desc=True)
             .execute().data or [])
+
+
+def unkeyed_articles() -> list[dict]:
+    """Rows not yet topic-processed (topic_key IS NULL)."""
+    return (client().table(TABLE)
+            .select("id,title_en,published_at,region_group,mentioned_entities")
+            .is_("topic_key", "null")
+            .order("published_at", desc=True)
+            .limit(500)
+            .execute().data or [])
+
+
+def set_topic_key(ids: list[str], topic_key: str) -> None:
+    client().table(TABLE).update({"topic_key": topic_key}).in_("id", ids).execute()
+
+
+def upsert_briefing(region_group: str, iso_week: str, briefing_html: str, article_count: int) -> None:
+    client().table("weekly_briefings").upsert(
+        {"region_group": region_group, "iso_week": iso_week,
+         "briefing_html": briefing_html, "article_count": article_count},
+        on_conflict="region_group,iso_week").execute()
